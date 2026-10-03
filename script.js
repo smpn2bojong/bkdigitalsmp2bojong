@@ -25,7 +25,23 @@ const STATE = { siswa:[], absensi:[], pelanggaran:[], konseling:[], kolaborasi:[
    situs ini (lihat PANDUAN-UPDATE.md), supaya guru mapel tidak perlu tahu atau
    menempel URL Apps Script sama sekali. Kalau dikosongkan, layar Admin BK tetap
    bisa mengisi URL secara manual seperti sebelumnya (mode lama tidak rusak). */
-const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbxwr9i6PcQd5IHRm3PHa48IYnUC2pSCAPG0sG3K-1x9sb7126H8CwqBHrmSvMMXXwmHAw/exec';
+const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycby8r3OEvG7ZLZSkcYF7hoVpaKb-pnxbtjuSXmqxatBeYCn6iE1ZxrgKe0X59LaspN_Rew/exec';
+
+/* URL Web App yang pernah tersimpan di browser (localStorage) dulu SELALU menang atas
+   DEFAULT_API_URL, jadi setelah URL di file ini diganti, browser yang sudah pernah login
+   tetap memanggil server LAMA (akibatnya login gagal walau kode sudah diperbarui).
+   Sekarang URL & sesi lama dibuang otomatis kalau DEFAULT_API_URL berubah dari yang
+   terakhir dipakai browser ini. Pengguna cukup login ulang satu kali. */
+(function reconcileApiUrl(){
+  if (!DEFAULT_API_URL) return;
+  try{
+    if (localStorage.getItem('bk_api_url_snapshot') !== DEFAULT_API_URL){
+      ['bk_api_url','bk_api_token','bk_role','bk_guru_nama','bk_guru_kelas','bk_konselor_nama','bk_konselor_kelas']
+        .forEach(k => localStorage.removeItem(k));
+      localStorage.setItem('bk_api_url_snapshot', DEFAULT_API_URL);
+    }
+  }catch(e){}
+})();
 
 let API_URL = localStorage.getItem('bk_api_url') || DEFAULT_API_URL;
 let API_TOKEN = localStorage.getItem('bk_api_token') || '';
@@ -75,6 +91,16 @@ function renderSchoolProfile(){
 }
 
 /* ---------------- ADAPTER: real Apps Script vs offline demo ---------------- */
+/* Backend versi lama menolak aksi login dengan pesan "Token akses salah atau kosong".
+   Pesan itu tidak ada di Code.gs terbaru, jadi kalau muncul berarti server yang
+   dipanggil belum memakai Code.gs terbaru / belum di-deploy ulang. */
+function explainLoginError(msg){
+  if (/token akses salah|periksa pengaturan koneksi/i.test(String(msg || ''))){
+    return 'Server (Google Apps Script) masih memakai kode lama. Admin: tempel Code.gs terbaru, lalu Deploy > Manage deployments > New version.';
+  }
+  return msg || 'Gagal login';
+}
+
 const RealAdapter = {
   /* Login Guru Mapel: hanya kirim username & password (tidak pernah URL/token
      master), backend membalas sessionToken terbatas yang lalu dipakai sebagai
@@ -82,7 +108,7 @@ const RealAdapter = {
   async loginGuru(username, password){
     const res = await fetch(API_URL, { method:'POST', body: JSON.stringify({ action:'loginGuru', username, password }) });
     const json = await res.json();
-    if (!json.ok) throw new Error(json.error || 'Gagal login');
+    if (!json.ok) throw new Error(explainLoginError(json.error));
     return json.data;
   },
   /* Login Konselor (Guru BK per-kelas): sama alurnya dengan loginGuru, hanya
@@ -90,7 +116,7 @@ const RealAdapter = {
   async loginKonselor(username, password){
     const res = await fetch(API_URL, { method:'POST', body: JSON.stringify({ action:'loginKonselor', username, password }) });
     const json = await res.json();
-    if (!json.ok) throw new Error(json.error || 'Gagal login');
+    if (!json.ok) throw new Error(explainLoginError(json.error));
     return json.data;
   },
   async getAll(type){
@@ -888,11 +914,20 @@ document.addEventListener('click', e => {
 });
 
 /* ---------------- KOMBOBOX PENCARIAN SISWA (dipakai di semua form: absensi, pelanggaran, dst) ---------------- */
+/* Daftar kelas yang boleh dipilih saat MENCATAT data lewat form. Konselor dengan kelas
+   tanggung jawab hanya melihat kelasnya sendiri (server tetap menolak kelas lain). */
+function writableKelasList(){
+  const all = uniqueClasses();
+  if (USER_ROLE !== 'konselor' || !KONSELOR_KELAS.length) return all;
+  const own = KONSELOR_KELAS.map(k => String(k).trim().toLowerCase());
+  return all.filter(c => own.includes(String(c).trim().toLowerCase()));
+}
 function siswaPickerFilter(wrap, query){
   const q = (query||'').trim().toLowerCase();
   const kelasSel = wrap.querySelector('.siswa-picker-kelas');
   const kelas = kelasSel ? kelasSel.value : '';
-  let list = STATE.siswa;
+  const allowed = writableKelasList();
+  let list = STATE.siswa.filter(s => allowed.includes(s.Kelas));
   if (kelas) list = list.filter(s => s.Kelas === kelas);
   return list.filter(s => !q ||
     (s.Nama||'').toLowerCase().includes(q) ||
@@ -912,6 +947,7 @@ function siswaPickerRenderDropdown(wrap, query){
   dd.classList.add('open');
 }
 document.addEventListener('input', e => {
+  if (e.target.name === 'NamaOrtuWali') e.target.dataset.auto = '0'; // diketik manual -> jangan ditimpa otomatis
   if (!e.target.classList.contains('siswa-picker-input')) return;
   const wrap = e.target.closest('.siswa-picker');
   wrap.querySelector('input[type=hidden]').value = '';
@@ -942,7 +978,10 @@ document.addEventListener('click', e => {
     wrap.querySelector('.siswa-picker-dropdown').classList.remove('open');
     // Form Kolaborasi: isi otomatis Nama Orang Tua/Wali dari data siswa (hanya kalau masih kosong)
     const ortuInput = wrap.closest('form') && wrap.closest('form').querySelector('input[name="NamaOrtuWali"]');
-    if (ortuInput && !ortuInput.value.trim()) ortuInput.value = s.NamaOrtu || '';
+    if (ortuInput && (!ortuInput.value.trim() || ortuInput.dataset.auto === '1')){
+      ortuInput.value = s.NamaOrtu || '';
+      ortuInput.dataset.auto = '1'; // terisi otomatis: boleh diganti lagi kalau pilih siswa lain
+    }
     return;
   }
   $all('.siswa-picker-dropdown.open').forEach(dd => {
@@ -1415,7 +1454,7 @@ function openForm(type, id, prefill){
     if (f.type === 'select-siswa'){
       const selSiswa = val ? siswaById(val) : null;
       const displayVal = selSiswa ? `${selSiswa.Nama} — ${selSiswa.Kelas||'-'}` : '';
-      const kelasOpts = uniqueClasses().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+      const kelasOpts = writableKelasList().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
       return `<div class="${wrapClass}"><label>${f.label}</label>
         <div class="siswa-picker">
           <div class="siswa-picker-row">
